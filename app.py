@@ -1,6 +1,7 @@
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.onnx
 import importlib.util
 import sys
 import os
@@ -12,6 +13,7 @@ import json
 import inspect
 import pandas as pd
 import gc
+import re
 from collections import OrderedDict
 from streamlit_agraph import agraph, Node, Edge, Config
 from torchview import draw_graph
@@ -20,6 +22,7 @@ import textwrap
 from pygments import highlight
 from pygments.lexers import PythonLexer
 from pygments.formatters import HtmlFormatter
+from io import BytesIO
 
 # --- CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="NeuroScope Pro: Industry Standard Debugger")
@@ -76,21 +79,26 @@ st.markdown("""
 # --- UTILITY: PROJECT LOADING & AST ANALYSIS ---
 
 class ProjectLoader:
-    """Handles File/Zip uploads and sys.path setup with complete module resolution."""
+    """
+    Handles File/Zip uploads, flattens structure, and resolves all imports transparently.
+    """
+
     def __init__(self, uploaded_file):
         self.uploaded_file = uploaded_file
         self.temp_dir = tempfile.mkdtemp()
+        self.flat_dir = os.path.join(self.temp_dir, "flattened")
         self.is_zip = uploaded_file.name.endswith('.zip')
         self.module_cache = {}
+        self.import_map = {}  # Maps original imports to flattened modules
 
     def __enter__(self):
+        # Extract files
         if self.is_zip:
             zip_path = os.path.join(self.temp_dir, "project.zip")
             with open(zip_path, "wb") as f:
                 f.write(self.uploaded_file.getbuffer())
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(self.temp_dir)
-            # Cleanup MacOS junk
             if os.path.exists(os.path.join(self.temp_dir, "__MACOSX")):
                 shutil.rmtree(os.path.join(self.temp_dir, "__MACOSX"))
         else:
@@ -98,58 +106,270 @@ class ProjectLoader:
             with open(file_path, "wb") as f:
                 f.write(self.uploaded_file.getbuffer())
 
-        if self.temp_dir not in sys.path:
-            sys.path.insert(0, self.temp_dir)
+        # Create flattened directory
+        os.makedirs(self.flat_dir, exist_ok=True)
+
+        # Flatten structure: copy all .py files to flat_dir and resolve imports
+        self._flatten_and_resolve()
+
+        if self.flat_dir not in sys.path:
+            sys.path.insert(0, self.flat_dir)
         
-        # Pre-import all Python modules in the project for cross-file dependencies
+        # Pre-import all modules
         self._preload_modules()
         
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.temp_dir in sys.path:
-            sys.path.remove(self.temp_dir)
+        if self.flat_dir in sys.path:
+            sys.path.remove(self.flat_dir)
         # Clear imported modules
         for mod_name in list(self.module_cache.keys()):
             if mod_name in sys.modules:
                 del sys.modules[mod_name]
         shutil.rmtree(self.temp_dir)
 
-    def _preload_modules(self):
-        """Pre-import all Python modules to resolve dependencies."""
+    def _flatten_and_resolve(self):
+        """
+        Flatten project structure and resolve all imports.
+        - Copies all .py files to flat_dir with name changes to avoid collisions
+        - Rewrites imports to match flattened structure
+        - Creates a transparent module resolution system
+        """
+        # Step 1: Collect all Python files with their original paths
+        file_mapping = {}  # {new_flat_name: (original_path, content)}
+        
         for root, _, files in os.walk(self.temp_dir):
-            for file in files:
-                if file.endswith(".py") and not file.startswith("__"):
-                    full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, self.temp_dir)
-                    module_name = rel_path.replace(os.sep, '.').replace('.py', '')
-                    
-                    try:
-                        spec = importlib.util.spec_from_file_location(module_name, full_path)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            sys.modules[module_name] = module
-                            spec.loader.exec_module(module)
-                            self.module_cache[module_name] = module
-                    except Exception as e:
-                        # Skip modules that can't be imported independently
-                        pass
-
-    def get_py_files(self):
-        py_files = []
-        for root, _, files in os.walk(self.temp_dir):
+            # Skip the flattened dir and zip file
+            if "flattened" in root or "__MACOSX" in root:
+                continue
+            
             for file in files:
                 if file.endswith(".py"):
                     full_path = os.path.join(root, file)
-                    py_files.append(os.path.relpath(full_path, self.temp_dir))
+                    rel_path = os.path.relpath(full_path, self.temp_dir)
+                    
+                    # Read original content
+                    try:
+                        with open(full_path, "r", encoding='utf-8') as f:
+                            content = f.read()
+                    except:
+                        continue
+                    
+                    # Create flattened name (e.g., src/models/vgg.py -> src_models_vgg.py)
+                    flat_name = rel_path.replace(os.sep, '_').replace('.py', '.py')
+                    flat_name = flat_name.lstrip('_')
+                    
+                    file_mapping[flat_name] = {
+                        'original_path': rel_path,
+                        'content': content
+                    }
+        
+        # Step 2: Build import resolution map
+        self._build_import_map(file_mapping)
+        
+        # Step 3: Rewrite imports and save flattened files
+        for flat_name, file_info in file_mapping.items():
+            content = file_info['content']
+            
+            # Rewrite imports
+            content = self._rewrite_imports(content, flat_name)
+            
+            # Save to flattened directory
+            flat_path = os.path.join(self.flat_dir, flat_name)
+            with open(flat_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+    def _build_import_map(self, file_mapping):
+        """
+        Build a map of all possible imports and their flattened equivalents.
+        """
+        for flat_name, file_info in file_mapping.items():
+            original_path = file_info['original_path']
+            # Convert path to module name
+            module_name = original_path.replace(os.sep, '.').replace('.py', '')
+            
+            # Map both original and flattened names
+            self.import_map[module_name] = flat_name.replace('.py', '')
+            
+            # Also map directory-based imports (e.g., 'src.models' -> file in src/models/)
+            parts = original_path.replace(os.sep, '.').replace('.py', '').split('.')
+            for i in range(len(parts)):
+                partial = '.'.join(parts[:i+1])
+                if partial not in self.import_map:
+                    self.import_map[partial] = flat_name.replace('.py', '')
+
+    def _rewrite_imports(self, content, flat_name):
+        """
+        Rewrite all imports in the content to use flattened module names.
+        """
+        lines = content.split('\n')
+        rewritten_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            indent_str = ' ' * indent
+            
+            # Skip empty lines and comments
+            if not stripped or stripped.startswith('#'):
+                rewritten_lines.append(line)
+                continue
+            
+            # Handle: from X import Y
+            if stripped.startswith('from ') and ' import ' in stripped:
+                match = re.match(r'from\s+([\w.]+)\s+import\s+(.+)', stripped)
+                if match:
+                    module_name = match.group(1)
+                    imports = match.group(2)
+                    
+                    # Don't rewrite torch imports
+                    if module_name.startswith('torch'):
+                        rewritten_lines.append(line)
+                    else:
+                        resolved = self._resolve_module_name(module_name)
+                        if resolved and resolved != module_name:
+                            rewritten_lines.append(indent_str + f'from {resolved} import {imports}')
+                        else:
+                            rewritten_lines.append(line)
+                else:
+                    rewritten_lines.append(line)
+            
+            # Handle: import X [as Y]
+            elif stripped.startswith('import '):
+                match = re.match(r'import\s+([\w.]+)(?:\s+as\s+(\w+))?', stripped)
+                if match:
+                    module_name = match.group(1)
+                    alias = match.group(2)
+                    
+                    # Don't rewrite torch imports
+                    if module_name.startswith('torch'):
+                        rewritten_lines.append(line)
+                    else:
+                        resolved = self._resolve_module_name(module_name)
+                        if resolved and resolved != module_name:
+                            if alias:
+                                rewritten_lines.append(indent_str + f'import {resolved} as {alias}')
+                            else:
+                                rewritten_lines.append(indent_str + f'import {resolved}')
+                        else:
+                            rewritten_lines.append(line)
+                else:
+                    rewritten_lines.append(line)
+            
+            else:
+                rewritten_lines.append(line)
+        
+        return '\n'.join(rewritten_lines)
+
+    def _resolve_module_name(self, module_name):
+        """
+        Resolve a module name using the import map.
+        """
+        # Direct match
+        if module_name in self.import_map:
+            return self.import_map[module_name]
+        
+        # Try parent modules
+        parts = module_name.split('.')
+        for i in range(len(parts), 0, -1):
+            partial = '.'.join(parts[:i])
+            if partial in self.import_map:
+                return self.import_map[partial]
+        
+        # No match found
+        return module_name
+
+    def _preload_modules(self):
+        """
+        Pre-import all Python modules with enhanced error handling.
+        Loads modules in dependency order to resolve cross-imports.
+        """
+        max_retries = 3
+        loaded_modules = set()
+        remaining_files = {}
+        
+        # First pass: collect all files
+        for root, _, files in os.walk(self.flat_dir):
+            for file in files:
+                if file.endswith(".py"):
+                    full_path = os.path.join(root, file)
+                    module_name = file.replace('.py', '')
+                    remaining_files[module_name] = full_path
+        
+        # Try to load modules with retries (handles circular dependencies)
+        for attempt in range(max_retries):
+            modules_to_remove = []
+            
+            for module_name, full_path in remaining_files.items():
+                if module_name in loaded_modules:
+                    modules_to_remove.append(module_name)
+                    continue
+                
+                try:
+                    with open(full_path, "r", encoding='utf-8') as f:
+                        code = f.read()
+                    
+                    # Security scan
+                    dangerous_patterns = ["os.system", "subprocess.call", "exec(", "eval(", "__import__"]
+                    if any(pattern in code for pattern in dangerous_patterns):
+                        modules_to_remove.append(module_name)
+                        continue
+                    
+                    spec = importlib.util.spec_from_file_location(module_name, full_path)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        # Make module available before execution (handles circular deps)
+                        sys.modules[module_name] = module
+                        
+                        try:
+                            spec.loader.exec_module(module)
+                            self.module_cache[module_name] = module
+                            loaded_modules.add(module_name)
+                            modules_to_remove.append(module_name)
+                        except ImportError as ie:
+                            # Re-try later (dependency not yet loaded)
+                            if attempt < max_retries - 1:
+                                pass  # Keep in remaining_files
+                            else:
+                                modules_to_remove.append(module_name)
+                        except Exception as e:
+                            # Other errors - skip this module
+                            modules_to_remove.append(module_name)
+                except Exception as e:
+                    modules_to_remove.append(module_name)
+            
+            # Remove successfully loaded or failed modules
+            for module_name in modules_to_remove:
+                remaining_files.pop(module_name, None)
+            
+            # If no modules left, we're done
+            if not remaining_files:
+                break
+
+    def get_py_files(self):
+        """
+        Retrieve list of Python files in the flattened directory.
+        """
+        py_files = []
+        for root, _, files in os.walk(self.flat_dir):
+            for file in files:
+                if file.endswith(".py"):
+                    full_path = os.path.join(root, file)
+                    py_files.append(os.path.relpath(full_path, self.flat_dir))
         return py_files
 
 class ArchitectureScanner:
-    """Scans .py files for classes inheriting from nn.Module with enhanced metadata."""
-    
+    """
+    Scans .py files for classes inheriting from nn.Module (handles unresolved imports).
+    """
+
     @staticmethod
     def scan(root_dir, file_rel_paths):
-        found_classes = [] # List of tuples (class_name, file_path, imports, dependencies)
+        """
+        Scan files for nn.Module subclasses with robust import resolution.
+        """
+        found_classes = []
         
         for f_path in file_rel_paths:
             full_path = os.path.join(root_dir, f_path)
@@ -158,39 +378,65 @@ class ArchitectureScanner:
                     content = f.read()
                     tree = ast.parse(content)
                 
-                # Extract imports
-                imports = []
+                # Extract imports to build context
+                imports = {}
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
                         for alias in node.names:
-                            imports.append(alias.name)
+                            imports[alias.asname or alias.name] = alias.name
                     elif isinstance(node, ast.ImportFrom):
-                        imports.append(f"{node.module}")
+                        if node.module:
+                            for alias in node.names:
+                                imports[alias.asname or alias.name] = node.module
                 
                 # Look for classes
                 for node in ast.walk(tree):
                     if isinstance(node, ast.ClassDef):
                         is_module = False
+                        base_names = []
+                        
+                        # Check all base classes
                         for base in node.bases:
+                            base_names.append(base)
+                            
+                            # Direct: class X(Module)
                             if isinstance(base, ast.Name) and base.id == 'Module':
                                 is_module = True
-                            elif isinstance(base, ast.Attribute) and base.attr == 'Module':
-                                is_module = True
+                            
+                            # Qualified: class X(nn.Module)
+                            elif isinstance(base, ast.Attribute):
+                                if base.attr == 'Module':
+                                    is_module = True
+                        
+                        # If not found directly, check if base is imported from torch.nn
+                        if not is_module:
+                            for base in base_names:
+                                if isinstance(base, ast.Name):
+                                    base_id = base.id
+                                    # Check if this is imported from torch.nn
+                                    if base_id in imports:
+                                        import_source = imports[base_id]
+                                        if 'torch.nn' in import_source or import_source == 'nn':
+                                            is_module = True
+                                            break
                         
                         if is_module:
                             found_classes.append({
                                 'name': node.name,
-                                'file': f_path,
-                                'imports': imports,
+                                'file': f_path.replace('.py', ''),  # Flattened module name
+                                'imports': list(imports.values()),
                                 'line': node.lineno
                             })
             except Exception as e:
-                continue
+                pass
+        
         return found_classes
 
-def load_dynamic_class(root_dir, file_rel_path, class_name):
-    file_path = os.path.join(root_dir, file_rel_path)
-    module_name = file_rel_path.replace(os.sep, '.').replace('.py', '')
+def load_dynamic_class(root_dir, module_name, class_name):
+    """
+    Load a class dynamically from a flattened module.
+    """
+    file_path = os.path.join(root_dir, module_name + '.py')
     
     try:
         # Check if already loaded
@@ -198,12 +444,27 @@ def load_dynamic_class(root_dir, file_rel_path, class_name):
             return getattr(sys.modules[module_name], class_name)
         
         spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if not spec or not spec.loader:
+            raise ImportError(f"Cannot create module spec for {module_name}")
+        
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exec_error:
+            st.warning(f"Module execution warning: {exec_error}")
+        
+        if not hasattr(module, class_name):
+            available = [name for name in dir(module) if not name.startswith('_') and isinstance(getattr(module, name), type)]
+            raise AttributeError(
+                f"Class '{class_name}' not found in module '{module_name}'. "
+                f"Available classes: {', '.join(available[:5])}"
+            )
+        
         return getattr(module, class_name)
     except Exception as e:
-        raise e
+        raise ValueError(f"Failed to load class {class_name} from {module_name}: {e}")
 
 # --- UTILITY: INTERACTIVE ARGUMENT PARSING ---
 
@@ -219,7 +480,8 @@ def generate_init_form(model_class):
     i = 0
     
     for name, param in params.items():
-        if name == 'self': continue
+        if name == 'self':
+            continue
         
         col = cols[i % 2]
         i += 1
@@ -229,11 +491,11 @@ def generate_init_form(model_class):
         
         # Type inference and widget generation
         if param.annotation is int or isinstance(default, int):
-            val = default if isinstance(default, int) else 0
+            val = default if isinstance(default, int) else 3  # Default to 3 for most int params
             args[name] = col.number_input(label, value=val, step=1, help=f"Type: int")
             
         elif param.annotation is float or isinstance(default, float):
-            val = default if isinstance(default, float) else 0.0
+            val = default if isinstance(default, float) else 0.5  # Default to 0.5 for float params
             args[name] = col.number_input(label, value=val, format="%.4f", help=f"Type: float")
             
         elif param.annotation is bool or isinstance(default, bool):
@@ -241,7 +503,19 @@ def generate_init_form(model_class):
             args[name] = col.checkbox(label, value=val)
             
         else:
-            val = str(default) if default is not None else ""
+            # Provide sensible defaults based on parameter name
+            if 'channel' in name.lower() or 'input' in name.lower():
+                default_val = default if default is not None else 3
+            elif 'class' in name.lower() or 'output' in name.lower():
+                default_val = default if default is not None else 10
+            elif 'embed' in name.lower() or 'hidden' in name.lower():
+                default_val = default if default is not None else 512
+            elif 'layer' in name.lower() or 'block' in name.lower():
+                default_val = default if default is not None else 4
+            else:
+                default_val = default
+            
+            val = str(default_val) if default_val is not None else ""
             input_val = col.text_input(label, value=val, help="Type: String/JSON. Enter lists/dicts as JSON.")
             
             try:
@@ -295,10 +569,10 @@ class DetailedTracer:
                     params_info['weight'] = {
                         'shape': list(w.shape),
                         'dtype': str(w.dtype),
-                        'mean': f"{w.mean().item():.6f}",
-                        'std': f"{w.std().item():.6f}",
-                        'min': f"{w.min().item():.6f}",
-                        'max': f"{w.max().item():.6f}",
+                        'mean': w.mean().item(),
+                        'std': w.std().item(),
+                        'min': w.min().item(),
+                        'max': w.max().item(),
                         'numel': w.numel()
                     }
                 
@@ -307,8 +581,8 @@ class DetailedTracer:
                     params_info['bias'] = {
                         'shape': list(b.shape),
                         'dtype': str(b.dtype),
-                        'mean': f"{b.mean().item():.6f}",
-                        'std': f"{b.std().item():.6f}",
+                        'mean': b.mean().item(),
+                        'std': b.std().item(),
                         'numel': b.numel()
                     }
                 
@@ -345,11 +619,13 @@ class DetailedTracer:
             return fn
 
         for n, m in model.named_modules():
-            if n == "": continue 
+            if n == "":
+                continue
             self.hooks.append(m.register_forward_hook(hook(n, m)))
 
     def clear(self):
-        for h in self.hooks: h.remove()
+        for h in self.hooks:
+            h.remove()
         self.hooks = []
         self.data = OrderedDict()
 
@@ -406,7 +682,7 @@ def display_module_details(module_name, module_info):
         if module_info['module_attrs']:
             attrs_df = pd.DataFrame([module_info['module_attrs']]).T
             attrs_df.columns = ['Value']
-            st.dataframe(attrs_df, use_container_width=True)
+            st.dataframe(attrs_df, width='stretch')
         else:
             st.info("No special attributes")
     
@@ -420,7 +696,7 @@ def display_module_details(module_name, module_info):
             with st.expander(f"📊 {param_name.upper()} Statistics"):
                 stats_df = pd.DataFrame([param_stats]).T
                 stats_df.columns = ['Value']
-                st.dataframe(stats_df, use_container_width=True)
+                st.dataframe(stats_df, width='stretch')
     
     # Source code
     st.markdown("#### 💻 Source Code")
@@ -441,38 +717,62 @@ def main():
 
     if uploaded_file:
         # Use session state to persist results
-        if 'scan_results' not in st.session_state or st.session_state.last_upload != uploaded_file.name:
-            with ProjectLoader(uploaded_file) as loader:
-                files = loader.get_py_files()
-                classes = ArchitectureScanner.scan(loader.temp_dir, files)
-                st.session_state.scan_results = classes
-                st.session_state.last_upload = uploaded_file.name
-                st.session_state.temp_dir = loader.temp_dir
+        upload_key = uploaded_file.name
+        if 'scan_results' not in st.session_state or st.session_state.get('last_upload') != upload_key:
+            with st.spinner("📂 Loading and analyzing project..."):
+                with ProjectLoader(uploaded_file) as loader:
+                    files = loader.get_py_files()
+                    
+                    # Debug info
+                    with st.sidebar.expander("🔧 Debug Info"):
+                        st.write(f"**Files found:** {len(files)}")
+                        st.write(f"**Files:** {files}")
+                        st.write(f"**Modules loaded:** {len(loader.module_cache)}")
+                        if loader.module_cache:
+                            st.write(f"**Module names:** {list(loader.module_cache.keys())}")
+                    
+                    classes = ArchitectureScanner.scan(loader.flat_dir, files)
+                    st.session_state.scan_results = classes
+                    st.session_state.last_upload = upload_key
         
         found_classes = st.session_state.scan_results
         
         if not found_classes:
-            st.error("No `nn.Module` classes found in the uploaded files.")
+            st.error("❌ No `nn.Module` classes found in the uploaded files.")
+            st.info("""
+            **Troubleshooting:**
+            - Ensure your model classes inherit from `torch.nn.Module` or `nn.Module`
+            - Check that `import torch.nn as nn` or `from torch.nn import Module` is present
+            - Make sure the class is at module level (not nested inside a function)
+            - Example: `class MyModel(nn.Module):`
+            """)
             st.stop()
 
         # 2. SELECTION
         cls_options = [f"{c['name']} ({c['file']})" for c in found_classes]
         selected_option = st.sidebar.selectbox("Select Model Class", cls_options)
         selected_cls_name = selected_option.split(" (")[0]
-        selected_cls_file = selected_option.split(" (")[1][:-1]
+        selected_module_name = selected_option[selected_option.index("(") + 1:selected_option.rindex(")")]
 
         # Display model info
-        selected_class = next(c for c in found_classes if c['name'] == selected_cls_name)
+        selected_class = next(c for c in found_classes if c['name'] == selected_cls_name and c['file'] == selected_module_name)
         with st.sidebar.expander("📋 Model Info"):
-            st.write(f"**File:** {selected_class['file']}")
+            st.write(f"**Module:** `{selected_module_name}`")
             st.write(f"**Line:** {selected_class['line']}")
             st.write(f"**Dependencies:** {len(selected_class['imports'])}")
+            if selected_class['imports']:
+                st.write(f"**Imports:** {', '.join(selected_class['imports'][:5])}")
 
         # 3. DYNAMIC CONFIGURATION
         init_args = {}
+        export_onnx = False
+        opset_version = 14
+        dynamic_axes = False
+        shape_str = "1, 3, 224, 224"
+        
         with ProjectLoader(uploaded_file) as loader:
             try:
-                ModelClass = load_dynamic_class(loader.temp_dir, selected_cls_file, selected_cls_name)
+                ModelClass = load_dynamic_class(loader.flat_dir, selected_module_name, selected_cls_name)
                 
                 with st.sidebar.form("config_form"):
                     init_args = generate_init_form(ModelClass)
@@ -483,7 +783,13 @@ def main():
                     # Advanced options
                     with st.expander("⚙️ Advanced Options"):
                         export_onnx = st.checkbox("Export ONNX", value=True)
-                        opset_version = st.number_input("ONNX Opset Version", value=14, min_value=9, max_value=18)
+                        opset_version = st.number_input(
+                            "ONNX Opset Version", 
+                            value=14, 
+                            min_value=9, 
+                            max_value=18,
+                            help="Higher versions support newer operators but less hardware support"
+                        )
                         dynamic_axes = st.checkbox("Enable Dynamic Axes", value=False)
                     
                     load_btn = st.form_submit_button("🚀 Compile & Trace", use_container_width=True)
@@ -497,13 +803,20 @@ def main():
                 with ProjectLoader(uploaded_file) as loader:
                     try:
                         # Instantiate
-                        ModelClass = load_dynamic_class(loader.temp_dir, selected_cls_file, selected_cls_name)
+                        ModelClass = load_dynamic_class(loader.flat_dir, selected_module_name, selected_cls_name)
                         model = ModelClass(**init_args)
                         model.eval()
                         
-                        # Parse Shape
-                        shape = [int(x.strip()) for x in shape_str.split(',')]
-                        dummy_input = torch.randn(*shape)
+                        # Parse Shape with validation
+                        try:
+                            shape = [int(x.strip()) for x in shape_str.split(',')]
+                            if len(shape) < 1 or any(s <= 0 for s in shape):
+                                st.error("❌ Invalid input shape. All dimensions must be positive integers.")
+                                st.stop()
+                            dummy_input = torch.randn(*shape)
+                        except ValueError:
+                            st.error("❌ Invalid input shape format. Use comma-separated integers (e.g., '1, 3, 224, 224')")
+                            st.stop()
                         
                         # Progress bar
                         progress_bar = st.progress(0)
@@ -548,30 +861,41 @@ def main():
                             
                             st.session_state.onnx_bytes = None
                             try:
-                                onnx_path = os.path.join(tempfile.gettempdir(), "model.onnx")
+                                onnx_buffer = BytesIO()
                                 
-                                export_params = {
-                                    'opset_version': opset_version,
-                                    'do_constant_folding': True,
-                                    'input_names': ['input'],
-                                    'output_names': ['output']
+                                # Use opset 18 or higher for best compatibility
+                                effective_opset = max(int(opset_version), 18)
+                                
+                                # Build export parameters
+                                export_kwargs = {
+                                    # 'input_names': ['input'],
+                                    # 'output_names': ['output'],
                                 }
                                 
+                                # Add dynamic axes if enabled
                                 if dynamic_axes:
-                                    export_params['dynamic_axes'] = {
+                                    export_kwargs['dynamic_shapes'] = {
                                         'input': {0: 'batch_size'},
                                         'output': {0: 'batch_size'}
                                     }
                                 
-                                torch.onnx.export(model, dummy_input, onnx_path, **export_params)
+                                # Export to ONNX
+                                torch.onnx.export(
+                                    model,
+                                    (dummy_input,),
+                                    "my_model.onnx",
+                                    input_names=['input'],
+                                    dynamo=True,
+                                )
                                 
-                                with open(onnx_path, "rb") as f:
-                                    st.session_state.onnx_bytes = f.read()
-                            except ImportError:
-                                st.error("ONNX Export failed: Missing 'onnxscript'. Run `pip install onnxscript`.")
+                                # Get bytes from buffer
+                                st.session_state.onnx_bytes = onnx_buffer.getvalue()
+                                
+                            except ImportError as ie:
+                                st.error("ONNX Export failed: Missing required package. Run `pip install torch onnx`.")
                             except Exception as e:
-                                st.warning(f"ONNX Export failed: {e}")
-                        
+                                st.warning(f"ONNX Export failed: {str(e)[:200]}")
+
                         progress_bar.progress(100)
                         status_text.text("✅ Complete!")
                         
@@ -581,15 +905,18 @@ def main():
                         st.session_state.model_summary = {
                             'total_params': total_params,
                             'trainable_params': trainable_params,
-                            'model_size_mb': total_params * 4 / (1024 * 1024)  # Assuming float32
+                            'model_size_mb': total_params * 4 / (1024 * 1024)
                         }
+                        
+                        # Cleanup
+                        tracer.clear()
+                        gc.collect()
 
                     except Exception as e:
                         st.error(f"Critical Error: {e}")
                         st.exception(e)
 
     # --- VISUALIZATION TABS ---
-    
     if 'trace_data' in st.session_state:
         # Display model summary at top
         if 'model_summary' in st.session_state:
@@ -597,7 +924,7 @@ def main():
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Total Parameters", f"{summary['total_params']:,}")
             col2.metric("Trainable Parameters", f"{summary['trainable_params']:,}")
-            col3.metric("Model Size", f"{summary['model_size_mb']:.2f} MB")
+            col3.metric("Model Size", f"{summary['model_size_mb']} MB")
             col4.metric("Trace Status", "✅ Success" if st.session_state.trace_status == "success" else "⚠️ Failed")
         
         st.divider()
@@ -680,9 +1007,10 @@ def main():
             else:
                 st.warning("Graph not available. Model may be incompatible with Torchview.")
 
-# TAB 3: MODULE ANALYSIS
+        # TAB 3: MODULE ANALYSIS
         with t3:
             st.markdown("### 🔬 Detailed Module Analysis")
+            data = st.session_state.trace_data
             
             if 'selected_module' in st.session_state:
                 module_name = st.session_state.selected_module
@@ -758,7 +1086,7 @@ def main():
                     
                     # ONNX file info
                     onnx_size = len(st.session_state.onnx_bytes) / (1024 * 1024)
-                    st.info(f"📊 ONNX File Size: {onnx_size:.2f} MB")
+                    st.info(f"📊 ONNX File Size: {onnx_size} MB")
                     
                     st.download_button(
                         label="⬇️ Download ONNX Model",
@@ -797,11 +1125,12 @@ def main():
                 
                 # Generate comprehensive report
                 if st.button("📝 Generate Full Report", use_container_width=True):
+                    data = st.session_state.trace_data
                     report_lines = []
                     report_lines.append("# Model Architecture Report\n")
                     report_lines.append(f"**Generated:** {pd.Timestamp.now()}\n")
                     report_lines.append(f"**Model Class:** {selected_cls_name}\n")
-                    report_lines.append(f"**Source File:** {selected_cls_file}\n\n")
+                    report_lines.append(f"**Source Module:** {selected_module_name}\n\n")
                     
                     if 'model_summary' in st.session_state:
                         summary = st.session_state.model_summary
@@ -810,7 +1139,7 @@ def main():
                         report_lines.append(f"|--------|-------|\n")
                         report_lines.append(f"| Total Parameters | {summary['total_params']:,} |\n")
                         report_lines.append(f"| Trainable Parameters | {summary['trainable_params']:,} |\n")
-                        report_lines.append(f"| Model Size | {summary['model_size_mb']:.2f} MB |\n\n")
+                        report_lines.append(f"| Model Size | {summary['model_size_mb']} MB |\n\n")
                     
                     report_lines.append("## Layer-by-Layer Analysis\n\n")
                     
@@ -865,18 +1194,19 @@ def main():
                 # Quick stats preview
                 st.markdown("#### 📊 Quick Statistics")
                 
+                data = st.session_state.trace_data
                 if data:
-                    # Calculate statistics
+                    # Calculate statistics - keep as integers, not formatted strings
                     total_layers = len(data)
                     param_layers = sum(1 for m in data.values() if m['params_total'] > 0)
                     total_params = sum(m['params_total'] for m in data.values())
                     
                     stats_df = pd.DataFrame({
                         'Metric': ['Total Layers', 'Parametric Layers', 'Total Parameters'],
-                        'Value': [total_layers, param_layers, f"{total_params:,}"]
+                        'Value': [total_layers, param_layers, total_params]
                     })
                     
-                    st.dataframe(stats_df, hide_index=True, use_container_width=True)
+                    st.dataframe(stats_df, hide_index=True, width='stretch')
             
             # Additional export options
             st.divider()
@@ -887,6 +1217,7 @@ def main():
             with col3:
                 st.markdown("**📊 Parameters CSV**")
                 if st.button("Generate CSV", key="export_csv", use_container_width=True):
+                    data = st.session_state.trace_data
                     params_data = []
                     for mod_name, mod_info in data.items():
                         params_data.append({
@@ -911,6 +1242,7 @@ def main():
             with col4:
                 st.markdown("**📋 Layer Summary**")
                 if st.button("Generate Summary", key="layer_summary", use_container_width=True):
+                    data = st.session_state.trace_data
                     # Create a summary of layer types
                     layer_types = {}
                     for mod_info in data.values():
@@ -1026,7 +1358,6 @@ class SimpleCNN(nn.Module):
         x = self.fc(x)
         return x
                 ''', language='python')
-        
         with col2:
             with st.expander("📝 Example: Multi-file Project"):
                 st.code('''
